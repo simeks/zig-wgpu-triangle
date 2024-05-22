@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const glfw = @cImport({
     @cDefine("GLFW_INCLUDE_NONE", "1");
     @cInclude("GLFW/glfw3.h");
@@ -9,6 +10,60 @@ const wgpu = @cImport({
 
 // From glfw3native.h, had some issues including that one so forwards declaring it here
 extern fn glfwGetWin32Window(?*glfw.GLFWwindow) ?std.os.windows.HWND;
+extern fn glfwGetCocoaWindow(?*glfw.GLFWwindow) ?*anyopaque;
+
+// No worries about these being accessible for win builds as long as they are not referenced,
+// Might change in the future though.
+// https://github.com/ziglang/zig/issues/335
+
+const objc = @cImport({
+    @cInclude("objc/runtime.h");
+    @cInclude("objc/message.h");
+});
+
+fn createMetalLayer(ns_window: *anyopaque) !*anyopaque {
+    // Feels a bit like black magic, but talks to the objc runtime through.
+    //
+    // objc_msgSend takes a class, a selector, and a variadic list of arguments, so
+    // we cast the function pointer according to our needs.
+    // - https://developer.apple.com/documentation/objectivec/1456712-objc_msgsend
+
+    // objc_msgSend(instance, selector)
+    const send_fn = @as(
+        *const fn (*anyopaque, objc.SEL) callconv(.C) ?*anyopaque,
+        @ptrCast(&objc.objc_msgSend),
+    );
+    // objc_msgSend(instance, selector, bool)
+    const send_bool_fn = @as(
+        *const fn (*anyopaque, objc.SEL, bool) callconv(.C) void,
+        @ptrCast(&objc.objc_msgSend),
+    );
+    // objc_msgSend(instance, selector, ptr)
+    const send_ptr_fn = @as(
+        *const fn (*anyopaque, objc.SEL, *anyopaque) callconv(.C) void,
+        @ptrCast(&objc.objc_msgSend),
+    );
+
+    // [ns_window contentView]
+    const content_view = send_fn(ns_window, objc.sel_registerName("contentView").?);
+    if (content_view == null) {
+        return error.GetNSViewFailed;
+    }
+
+    // [ns_window.contentView setWantsLayer:YES];
+    send_bool_fn(content_view.?, objc.sel_registerName("setWantsLayer:").?, true);
+
+    // [CAMetalLayer layer]
+    const layer = send_fn(objc.objc_getClass("CAMetalLayer").?, objc.sel_registerName("layer").?);
+    if (layer == null) {
+        return error.GetMetalLayerFailed;
+    }
+
+    // [ns_window.contentView setLayer:layer];
+    send_ptr_fn(content_view.?, objc.sel_registerName("setLayer:").?, layer.?);
+
+    return layer.?;
+}
 
 pub fn main() !void {
     if (glfw.glfwInit() == glfw.GLFW_FALSE) {
@@ -35,17 +90,41 @@ pub fn main() !void {
         return error.CreateInstanceFailed;
     }
 
-    const surface_desc = wgpu.WGPUSurfaceDescriptorFromWindowsHWND{
-        .chain = .{
-            .next = null,
-            .sType = wgpu.WGPUSType_SurfaceDescriptorFromWindowsHWND,
+    const surface = switch (builtin.target.os.tag) {
+        .windows => surface: {
+            const surface_desc = wgpu.WGPUSurfaceDescriptorFromWindowsHWND{
+                .chain = .{
+                    .next = null,
+                    .sType = wgpu.WGPUSType_SurfaceDescriptorFromWindowsHWND,
+                },
+                .hinstance = std.os.windows.kernel32.GetModuleHandleW(null).?,
+                .hwnd = glfwGetWin32Window(window),
+            };
+            break :surface wgpu.wgpuInstanceCreateSurface(instance, &wgpu.WGPUSurfaceDescriptor{
+                .nextInChain = @ptrCast(&surface_desc),
+            });
         },
-        .hinstance = std.os.windows.kernel32.GetModuleHandleW(null).?,
-        .hwnd = glfwGetWin32Window(window),
+        .macos => surface: {
+            const native_window = glfwGetCocoaWindow(window);
+            if (native_window == null) {
+                return error.GetCocoaWindowFailed;
+            }
+
+            const layer = try createMetalLayer(native_window.?);
+
+            const surface_desc = wgpu.WGPUSurfaceDescriptorFromMetalLayer{
+                .chain = .{
+                    .next = null,
+                    .sType = wgpu.WGPUSType_SurfaceDescriptorFromMetalLayer,
+                },
+                .layer = layer,
+            };
+            break :surface wgpu.wgpuInstanceCreateSurface(instance, &wgpu.WGPUSurfaceDescriptor{
+                .nextInChain = @ptrCast(&surface_desc),
+            });
+        },
+        else => unreachable,
     };
-    const surface = wgpu.wgpuInstanceCreateSurface(instance, &wgpu.WGPUSurfaceDescriptor{
-        .nextInChain = @ptrCast(&surface_desc),
-    });
     defer wgpu.wgpuSurfaceRelease(surface);
     if (surface == null) {
         std.debug.print("Failed to create WGPU surface\n", .{});
