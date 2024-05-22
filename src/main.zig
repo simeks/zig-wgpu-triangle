@@ -21,46 +21,115 @@ const objc = @cImport({
     @cInclude("objc/message.h");
 });
 
+/// Calls objc_sendMsg with the given selector and arguments.
+/// A bit overkill in this case, but fun nonetheless. Uses the zig type system to
+/// automatically derive the correct call signature for objc_sendMsg.
+fn objcSendMsg(
+    self: *anyopaque,
+    selector: [*:0]const u8,
+    args: anytype,
+    comptime ReturnType: type,
+) !ReturnType {
+    const args_info = @typeInfo(@TypeOf(args)).Struct.fields;
+    const FnParams = comptime block: {
+        var Params: [2 + args_info.len]std.builtin.Type.Fn.Param = undefined;
+        Params[0] = .{ .type = @TypeOf(self), .is_generic = false, .is_noalias = false };
+        Params[1] = .{ .type = objc.SEL, .is_generic = false, .is_noalias = false };
+        for (args_info, 2..) |field, i| {
+            const param = std.builtin.Type.Fn.Param{
+                .type = field.type,
+                .is_generic = false,
+                .is_noalias = false,
+            };
+            Params[i] = param;
+        }
+        break :block &Params;
+    };
+    const FnType = @Type(.{
+        .Fn = .{
+            .calling_convention = .C,
+            .is_generic = false,
+            .is_var_args = false,
+            .return_type = ReturnType,
+            .params = FnParams,
+        },
+    });
+
+    const send_fn = @as(
+        *const FnType,
+        @ptrCast(&objc.objc_msgSend),
+    );
+
+    const sel = objc.sel_registerName(selector);
+    if (sel == null) {
+        return error.SelRegisterNameFailed;
+    }
+
+    return @call(.auto, send_fn, .{ self, sel } ++ args);
+}
 fn createMetalLayer(ns_window: *anyopaque) !*anyopaque {
-    // Feels a bit like black magic, but talks to the objc runtime through.
+    // Feels a bit like black magic, but talks to the objc runtime to create and
+    // set the needed layer for metal.
     //
     // objc_msgSend takes a class, a selector, and a variadic list of arguments, so
     // we cast the function pointer according to our needs.
     // - https://developer.apple.com/documentation/objectivec/1456712-objc_msgsend
 
-    // objc_msgSend(instance, selector)
-    const send_fn = @as(
-        *const fn (*anyopaque, objc.SEL) callconv(.C) ?*anyopaque,
-        @ptrCast(&objc.objc_msgSend),
-    );
-    // objc_msgSend(instance, selector, bool)
-    const send_bool_fn = @as(
-        *const fn (*anyopaque, objc.SEL, bool) callconv(.C) void,
-        @ptrCast(&objc.objc_msgSend),
-    );
-    // objc_msgSend(instance, selector, ptr)
-    const send_ptr_fn = @as(
-        *const fn (*anyopaque, objc.SEL, *anyopaque) callconv(.C) void,
-        @ptrCast(&objc.objc_msgSend),
-    );
-
     // [ns_window contentView]
-    const content_view = send_fn(ns_window, objc.sel_registerName("contentView").?);
+    const content_view = try objcSendMsg(ns_window, "contentView", .{}, ?*anyopaque);
     if (content_view == null) {
         return error.GetNSViewFailed;
     }
-
     // [ns_window.contentView setWantsLayer:YES];
-    send_bool_fn(content_view.?, objc.sel_registerName("setWantsLayer:").?, true);
-
+    try objcSendMsg(content_view.?, "setWantsLayer:", .{true}, void);
     // [CAMetalLayer layer]
-    const layer = send_fn(objc.objc_getClass("CAMetalLayer").?, objc.sel_registerName("layer").?);
+    const layer = try objcSendMsg(
+        objc.objc_getClass("CAMetalLayer").?,
+        "layer",
+        .{},
+        ?*anyopaque,
+    );
     if (layer == null) {
         return error.GetMetalLayerFailed;
     }
-
     // [ns_window.contentView setLayer:layer];
-    send_ptr_fn(content_view.?, objc.sel_registerName("setLayer:").?, layer.?);
+    try objcSendMsg(content_view.?, "setLayer:", .{layer}, void);
+
+    // Since this is a bit of a learning excerise for me, I'll leave the original and
+    // possibly more straightforward code below for reference.
+    // // objc_msgSend(instance, selector)
+    // const send_fn = @as(
+    //     *const fn (*anyopaque, objc.SEL) callconv(.C) ?*anyopaque,
+    //     @ptrCast(&objc.objc_msgSend),
+    // );
+    // // objc_msgSend(instance, selector, bool)
+    // const send_bool_fn = @as(
+    //     *const fn (*anyopaque, objc.SEL, bool) callconv(.C) void,
+    //     @ptrCast(&objc.objc_msgSend),
+    // );
+    // // objc_msgSend(instance, selector, ptr)
+    // const send_ptr_fn = @as(
+    //     *const fn (*anyopaque, objc.SEL, *anyopaque) callconv(.C) void,
+    //     @ptrCast(&objc.objc_msgSend),
+    // );
+
+    // // [ns_window contentView]
+    // const content_view = send_fn(ns_window, objc.sel_registerName("contentView").?);
+    // if (content_view == null) {
+    //     return error.GetNSViewFailed;
+    // }
+
+    // // [ns_window.contentView setWantsLayer:YES];
+    // send_bool_fn(content_view.?, objc.sel_registerName("setWantsLayer:").?, true);
+
+    // // [CAMetalLayer layer]
+    // const layer = send_fn(objc.objc_getClass("CAMetalLayer").?, objc.sel_registerName("layer").?);
+    // if (layer == null) {
+    //     return error.GetMetalLayerFailed;
+    // }
+
+    // // [ns_window.contentView setLayer:layer];
+    // send_ptr_fn(content_view.?, objc.sel_registerName("setLayer:").?, layer.?);
 
     return layer.?;
 }
